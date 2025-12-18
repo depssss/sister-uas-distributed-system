@@ -1,4 +1,7 @@
-# UTS – Distributed Systems  
+NAMA : DEWI PURNAMASARI 
+NIM : 11221087
+
+# UAS – Distributed Systems  
 ## Pub-Sub Log Aggregator dengan Idempotency & Deduplication
 
 ### Deskripsi Singkat
