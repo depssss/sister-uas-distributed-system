@@ -1,5 +1,9 @@
-# UTS – Distributed Systems  
+
+# UAS – Distributed Systems  
 ## Pub-Sub Log Aggregator dengan Idempotency & Deduplication
+
+### NAMA : DEWI PURNAMASARI 
+### NIM : 11221087
 
 ### Deskripsi Singkat
 Project ini membangun sistem **Publish–Subscribe Log Aggregator** berbasis **Docker Compose** yang terdiri dari beberapa service internal. Sistem dirancang untuk menangani **duplikasi event**, **idempotency**, serta **konkurensi** dengan pendekatan transaksi yang aman dan konsisten.
