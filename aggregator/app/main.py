@@ -1,139 +1,95 @@
 import asyncio
 import json
-import logging
 import os
-from datetime import datetime  # <--- TAMBAHAN PENTING
+import logging
+from datetime import datetime  # <--- 1. TAMBAHKAN IMPORT INI
 from contextlib import asynccontextmanager
+from fastapi import FastAPI
+from pydantic import BaseModel
 
-import redis.asyncio as redis
-import uvicorn
-from fastapi import FastAPI, HTTPException
-from sqlalchemy import select
-from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker
-from sqlalchemy.exc import IntegrityError
+# ... (kode import asyncpg/redis biarkan saja) ...
 
-from models import Base, ProcessedEventDB, EventSchema
+# ... (Logging Setup & Config biarkan saja) ...
 
-# --- CONFIG ---
-DATABASE_URL = os.getenv("DATABASE_URL", "postgresql+asyncpg://user:pass@localhost:5432/db")
-BROKER_URL = os.getenv("BROKER_URL", "redis://localhost:6379/0")
-QUEUE_NAME = "event_queue"
+class Event(BaseModel):
+    topic: str
+    event_id: str
+    timestamp: datetime  # <--- 2. UBAH DARI 'str' MENJADI 'datetime'
+    source: str
+    payload: dict
 
-# --- LOGGING ---
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
-logger = logging.getLogger("aggregator")
-
-# --- DATABASE ENGINE ---
-engine = create_async_engine(DATABASE_URL, echo=False, isolation_level="READ COMMITTED")
-AsyncSessionLocal = async_sessionmaker(engine, expire_on_commit=False)
-
-# --- REDIS CLIENT ---
-redis_client = redis.from_url(BROKER_URL, decode_responses=True)
-
-# --- WORKER PROCESS ---
-async def process_queue():
-    """Worker background untuk memproses queue dan insert ke DB"""
-    logger.info("Worker: Started listening to Redis...")
-    while True:
-        try:
-            # Atomic BLPOP: Tunggu item masuk queue
-            task = await redis_client.blpop(QUEUE_NAME, timeout=5)
-            if not task:
-                continue
-            
-            _, event_json = task
-            event_data = json.loads(event_json)
-            
-            async with AsyncSessionLocal() as session:
-                async with session.begin():
-                    try:
-                        # KONVERSI STRING KE DATETIME (Perbaikan disini)
-                        timestamp_obj = datetime.fromisoformat(event_data['timestamp'])
-
-                        # Buat object DB
-                        new_event = ProcessedEventDB(
-                            topic=event_data['topic'],
-                            event_id=event_data['event_id'],
-                            timestamp=timestamp_obj, # Gunakan object datetime, bukan string
-                            source=event_data['source']
-                        )
-                        session.add(new_event)
-                        # Flush untuk trigger Unique Constraint Check
-                        await session.flush()
-                        
-                        logger.info(f"Worker: Processed UNIQUE {event_data['event_id']}")
-                        await redis_client.incr("stats:unique_processed")
-                        
-                    except IntegrityError:
-                        # Tangani Duplikat
-                        logger.warning(f"Worker: Dropped DUPLICATE {event_data['event_id']}")
-                        await session.rollback()
-                        await redis_client.incr("stats:duplicate_dropped")
-                    except Exception as e:
-                        logger.error(f"Worker Error DB: {e}")
-                        await session.rollback()
-                        
-        except Exception as e:
-            logger.error(f"Worker Crash: {e}")
-            await asyncio.sleep(1)
-
-# --- LIFECYCLE ---
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Startup: Buat Table
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
-    # Start Worker
-    worker_task = asyncio.create_task(process_queue())
+    # 1. Setup Koneksi
+    app.state.pg_pool = await asyncpg.create_pool(DATABASE_URL)
+    app.state.redis = redis.from_url(BROKER_URL)
+    
+    # 2. Setup Database Schema (Idempotency Key)
+    async with app.state.pg_pool.acquire() as conn:
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS events (
+                id SERIAL PRIMARY KEY,
+                event_id TEXT NOT NULL,
+                topic TEXT NOT NULL,
+                source TEXT,
+                payload JSONB,
+                processed_at TIMESTAMP DEFAULT NOW(),
+                CONSTRAINT unique_event_topic UNIQUE (event_id, topic)
+            );
+        """)
+    
+    # 3. Start Background Worker
+    worker_task = asyncio.create_task(process_queue(app))
+    logger.info("System Started & DB Connected")
     
     yield
     
-    # Shutdown
+    # 4. Cleanup
     worker_task.cancel()
+    await app.state.pg_pool.close()
+    await app.state.redis.close()
 
 app = FastAPI(lifespan=lifespan)
 
-# --- API ENDPOINTS ---
 @app.post("/publish")
-async def publish_event(event: EventSchema):
-    try:
-        # Serialisasi datetime agar bisa masuk JSON Redis
-        payload_json = event.model_dump_json()
-        
-        # Masukkan ke Redis Queue
-        await redis_client.rpush(QUEUE_NAME, payload_json)
-        await redis_client.incr("stats:received")
-        
-        return {"status": "queued", "event_id": event.event_id}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.get("/events")
-async def get_events(topic: str = None):
-    async with AsyncSessionLocal() as session:
-        query = select(ProcessedEventDB)
-        if topic:
-            query = query.where(ProcessedEventDB.topic == topic)
-        query = query.limit(100)
-        result = await session.execute(query)
-        return result.scalars().all()
+async def publish_event(event: Event):
+    """Menerima event dan menaruhnya di antrian Redis."""
+    await app.state.redis.rpush("event_queue", event.json())
+    return {"status": "queued", "event_id": event.event_id}
 
 @app.get("/stats")
 async def get_stats():
-    received = await redis_client.get("stats:received") or 0
-    unique = await redis_client.get("stats:unique_processed") or 0
-    dropped = await redis_client.get("stats:duplicate_dropped") or 0
-    
-    async with AsyncSessionLocal() as session:
-        res = await session.execute(select(ProcessedEventDB.topic).distinct())
-        topics = res.scalars().all()
+    """Melihat jumlah data unik yang berhasil disimpan."""
+    async with app.state.pg_pool.acquire() as conn:
+        count = await conn.fetchval("SELECT COUNT(*) FROM events")
+    return {"unique_processed": count}
 
-    return {
-        "received": int(received),
-        "unique_processed": int(unique),
-        "duplicate_dropped": int(dropped),
-        "topics": topics
-    }
-
-if __name__ == "__main__":
-    uvicorn.run("main:app", host="0.0.0.0", port=8080)
+async def process_queue(app):
+    """Worker: Ambil dari Redis -> Simpan ke Postgres (Atomic Dedup)."""
+    logger.info("Worker started listening...")
+    while True:
+        try:
+            # Blocking pop (tunggu sampai ada data)
+            _, data = await app.state.redis.blpop("event_queue")
+            event = json.loads(data)
+            
+            async with app.state.pg_pool.acquire() as conn:
+                # Transaksi Database
+                async with conn.transaction():
+                    # TEKNIK DEDUP UTAMA: ON CONFLICT DO NOTHING
+                    result = await conn.execute("""
+                        INSERT INTO events (event_id, topic, source, payload)
+                        VALUES ($1, $2, $3, $4)
+                        ON CONFLICT (event_id, topic) DO NOTHING
+                    """, event['event_id'], event['topic'], event['source'], json.dumps(event['payload']))
+                    
+                    if result == "INSERT 0 1":
+                        logger.info(f"✅ Processed Unique: {event['event_id']}")
+                    else:
+                        logger.warning(f"♻️ Duplicate Dropped: {event['event_id']}")
+                        
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            logger.error(f"Error in worker: {e}")
+            await asyncio.sleep(1)

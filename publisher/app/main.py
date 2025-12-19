@@ -2,51 +2,40 @@ import time
 import uuid
 import random
 import requests
+import datetime
 import os
-from datetime import datetime
 
-TARGET_URL = os.getenv("TARGET_URL", "http://aggregator:8080/publish")
+AGGREGATOR_URL = os.getenv("TARGET_URL", "http://aggregator:8080/publish")
 
-def generate_event(repeat_id=None):
-    event_id = repeat_id if repeat_id else str(uuid.uuid4())
+def generate_event(id_override=None):
     return {
-        "topic": random.choice(["order.created", "payment.success", "user.login"]),
-        "event_id": event_id,
-        "timestamp": datetime.utcnow().isoformat(),
-        "source": "publisher-sim",
-        "payload": {"amount": random.randint(10, 1000)}
+        "topic": "orders",
+        "event_id": id_override or str(uuid.uuid4()),
+        "timestamp": datetime.datetime.now().isoformat(),
+        "source": "publisher-auto",
+        "payload": {"amount": random.randint(10, 500)}
     }
 
-def main():
-    print(f"Publisher starting... Target: {TARGET_URL}")
-    time.sleep(8) # Tunggu Aggregator & DB siap
-    
-    recent_ids = []
-
-    while True:
-        try:
-            # 30% kemungkinan kirim duplikat dari history
-            should_duplicate = (random.random() < 0.3) and (len(recent_ids) > 0)
+def run_simulation():
+    try:
+        # 1. Kirim Event Unik
+        print("--- Sending Unique Events ---")
+        for _ in range(3):
+            requests.post(AGGREGATOR_URL, json=generate_event())
+        
+        # 2. Kirim Duplikat (Untuk Demo Idempotency)
+        dup_id = f"DUP-{random.randint(1000,9999)}"
+        print(f"--- Sending DUPLICATES for ID: {dup_id} ---")
+        for _ in range(4):
+            # Mengirim ID yang sama 4 kali
+            requests.post(AGGREGATOR_URL, json=generate_event(id_override=dup_id))
             
-            if should_duplicate:
-                ev_id = random.choice(recent_ids)
-                payload = generate_event(repeat_id=ev_id)
-                print(f"Sending DUPLICATE: {ev_id}")
-            else:
-                payload = generate_event()
-                recent_ids.append(payload["event_id"])
-                # Simpan 50 ID terakhir untuk duplikasi
-                if len(recent_ids) > 50: recent_ids.pop(0)
-                print(f"Sending NEW: {payload['event_id']}")
-
-            resp = requests.post(TARGET_URL, json=payload, timeout=2)
-            
-            # Simulasi delay acak
-            time.sleep(random.uniform(0.1, 0.5))
-            
-        except Exception as e:
-            print(f"Error publishing: {e}")
-            time.sleep(2)
+    except Exception as e:
+        print(f"Connection error: {e}")
 
 if __name__ == "__main__":
-    main()
+    print("Publisher started. Waiting for aggregator...")
+    time.sleep(5) # Tunggu service lain
+    while True:
+        run_simulation()
+        time.sleep(5)
