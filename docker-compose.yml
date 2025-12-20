@@ -1,5 +1,5 @@
 services:
-  aggregator:  # <--- Sudah diperbaiki (sebelumnya aaggregator)
+  aggregator:  
     build: ./aggregator
     container_name: aggregator_service
     depends_on:
@@ -17,9 +17,9 @@ services:
     build: ./publisher
     container_name: publisher_service
     depends_on:
-      - aggregator # <--- Sekarang sudah cocok dengan nama di atas
+      - aggregator 
     environment:
-      - TARGET_URL=http://aggregator:8080/publish # <--- Hostname sudah benar
+      - TARGET_URL=http://aggregator:8080/publish 
     networks:
       - internal-net
 
