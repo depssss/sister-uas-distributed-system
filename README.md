@@ -4,7 +4,8 @@
 
 ### NAMA : DEWI PURNAMASARI 
 ### NIM : 11221087
-
+## Link Youtube 
+- **https://youtu.be/XvpERMj15qM?si=bO-lK9f8DHZ1OCEH**
 ### Deskripsi Singkat
 Project ini membangun sistem **Publish–Subscribe Log Aggregator** berbasis **Docker Compose** yang terdiri dari beberapa service internal. Sistem dirancang untuk menangani **duplikasi event**, **idempotency**, serta **konkurensi** dengan pendekatan transaksi yang aman dan konsisten.
 
