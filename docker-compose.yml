@@ -1,15 +1,13 @@
-version: '3.8'
-
 services:
-  aggregator:
+  aggregator:  # <--- Sudah diperbaiki (sebelumnya aaggregator)
     build: ./aggregator
     container_name: aggregator_service
     depends_on:
-      - storage
-      - broker
+      storage:
+        condition: service_healthy
     environment:
       - DATABASE_URL=postgresql://user:pass@storage:5432/db
-      - BROKER_URL=redis://broker:6379
+      - BROKER_URL=redis://broker:6379/0
     ports:
       - "8080:8080"
     networks:
@@ -19,9 +17,9 @@ services:
     build: ./publisher
     container_name: publisher_service
     depends_on:
-      - aggregator
+      - aggregator # <--- Sekarang sudah cocok dengan nama di atas
     environment:
-      - TARGET_URL=http://aggregator:8080/publish
+      - TARGET_URL=http://aggregator:8080/publish # <--- Hostname sudah benar
     networks:
       - internal-net
 

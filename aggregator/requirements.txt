@@ -1,8 +1,4 @@
-fastapi
-uvicorn
-sqlalchemy
-asyncpg
+flask
 redis
-pydantic
-python-dotenv
-httpx
+psycopg2-binary
+requests

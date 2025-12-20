@@ -1,95 +1,88 @@
-import asyncio
-import json
 import os
-import logging
-from datetime import datetime  # <--- 1. TAMBAHKAN IMPORT INI
-from contextlib import asynccontextmanager
-from fastapi import FastAPI
-from pydantic import BaseModel
+import redis
+import psycopg2
+import json
+from flask import Flask, request, jsonify
 
-# ... (kode import asyncpg/redis biarkan saja) ...
+app = Flask(__name__)
 
-# ... (Logging Setup & Config biarkan saja) ...
+# --- KONFIGURASI (Disamakan persis dengan docker-compose.yml) ---
+REDIS_HOST = os.getenv("REDIS_HOST", "broker")
+DB_HOST = os.getenv("POSTGRES_HOST", "storage")
+DB_NAME = os.getenv("POSTGRES_DB", "db")
+DB_USER = os.getenv("POSTGRES_USER", "user")
+DB_PASS = os.getenv("POSTGRES_PASSWORD", "pass")
 
-class Event(BaseModel):
-    topic: str
-    event_id: str
-    timestamp: datetime  # <--- 2. UBAH DARI 'str' MENJADI 'datetime'
-    source: str
-    payload: dict
+# Inisialisasi Redis
+r = redis.Redis(host=REDIS_HOST, port=6379, decode_responses=True)
 
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    # 1. Setup Koneksi
-    app.state.pg_pool = await asyncpg.create_pool(DATABASE_URL)
-    app.state.redis = redis.from_url(BROKER_URL)
-    
-    # 2. Setup Database Schema (Idempotency Key)
-    async with app.state.pg_pool.acquire() as conn:
-        await conn.execute("""
+def get_db_connection():
+    return psycopg2.connect(
+        host=DB_HOST,
+        database=DB_NAME,
+        user=DB_USER,
+        password=DB_PASS
+    )
+
+# Inisialisasi Tabel Database
+def init_db():
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute('''
             CREATE TABLE IF NOT EXISTS events (
                 id SERIAL PRIMARY KEY,
-                event_id TEXT NOT NULL,
-                topic TEXT NOT NULL,
+                event_id TEXT UNIQUE,
+                topic TEXT,
+                timestamp TIMESTAMP,
                 source TEXT,
-                payload JSONB,
-                processed_at TIMESTAMP DEFAULT NOW(),
-                CONSTRAINT unique_event_topic UNIQUE (event_id, topic)
+                payload JSONB
             );
-        """)
-    
-    # 3. Start Background Worker
-    worker_task = asyncio.create_task(process_queue(app))
-    logger.info("System Started & DB Connected")
-    
-    yield
-    
-    # 4. Cleanup
-    worker_task.cancel()
-    await app.state.pg_pool.close()
-    await app.state.redis.close()
+        ''')
+        conn.commit()
+        cur.close()
+        conn.close()
+        print("✅ Database initialized successfully.")
+    except Exception as e:
+        print(f"❌ Failed to initialize database: {e}")
 
-app = FastAPI(lifespan=lifespan)
+@app.route('/publish', methods=['POST'])
+def publish_event():
+    data = request.json
+    event_id = data.get("event_id")
 
-@app.post("/publish")
-async def publish_event(event: Event):
-    """Menerima event dan menaruhnya di antrian Redis."""
-    await app.state.redis.rpush("event_queue", event.json())
-    return {"status": "queued", "event_id": event.event_id}
+    # 1. CEK DUPLIKASI DI REDIS
+    if r.exists(event_id):
+        print(f"[DUPLICATE] Event {event_id} ignored.")
+        return jsonify({"status": "ignored", "reason": "duplicate"}), 200
 
-@app.get("/stats")
-async def get_stats():
-    """Melihat jumlah data unik yang berhasil disimpan."""
-    async with app.state.pg_pool.acquire() as conn:
-        count = await conn.fetchval("SELECT COUNT(*) FROM events")
-    return {"unique_processed": count}
+    try:
+        # 2. SIMPAN KE POSTGRES
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute(
+            "INSERT INTO events (event_id, topic, timestamp, source, payload) VALUES (%s, %s, %s, %s, %s)",
+            (event_id, data['topic'], data['timestamp'], data['source'], json.dumps(data['payload']))
+        )
+        conn.commit()
+        cur.close()
+        conn.close()
 
-async def process_queue(app):
-    """Worker: Ambil dari Redis -> Simpan ke Postgres (Atomic Dedup)."""
-    logger.info("Worker started listening...")
-    while True:
-        try:
-            # Blocking pop (tunggu sampai ada data)
-            _, data = await app.state.redis.blpop("event_queue")
-            event = json.loads(data)
-            
-            async with app.state.pg_pool.acquire() as conn:
-                # Transaksi Database
-                async with conn.transaction():
-                    # TEKNIK DEDUP UTAMA: ON CONFLICT DO NOTHING
-                    result = await conn.execute("""
-                        INSERT INTO events (event_id, topic, source, payload)
-                        VALUES ($1, $2, $3, $4)
-                        ON CONFLICT (event_id, topic) DO NOTHING
-                    """, event['event_id'], event['topic'], event['source'], json.dumps(event['payload']))
-                    
-                    if result == "INSERT 0 1":
-                        logger.info(f"✅ Processed Unique: {event['event_id']}")
-                    else:
-                        logger.warning(f"♻️ Duplicate Dropped: {event['event_id']}")
-                        
-        except asyncio.CancelledError:
-            break
-        except Exception as e:
-            logger.error(f"Error in worker: {e}")
-            await asyncio.sleep(1)
+        # 3. CATAT DI REDIS (Expiry 1 jam)
+        r.setex(event_id, 3600, "processed")
+
+        print(f"[SUCCESS] Event {event_id} saved to DB.")
+        return jsonify({"status": "success", "event_id": event_id}), 201
+
+    except Exception as e:
+        print(f"[ERROR] {e}")
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+@app.route('/', methods=['GET'])
+def index():
+    return "Aggregator Service is Running!", 200
+
+if __name__ == '__main__':
+    # Tunggu sebentar agar DB siap (opsional tapi disarankan)
+    init_db()
+    app.run(host='0.0.0.0', port=8080)
